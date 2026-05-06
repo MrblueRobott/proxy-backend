@@ -1,0 +1,262 @@
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import { createProxyMiddleware } from 'http-proxy-middleware';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Enable CORS for all origins
+app.use(cors());
+
+// Parse JSON bodies
+app.use(express.json());
+
+// Serve static files if you have any
+app.use(express.static('public'));
+
+// URL rewriting function
+function rewriteUrls(html, targetUrl, proxyPrefix) {
+  const baseUrl = new URL(targetUrl);
+  const origin = baseUrl.origin;
+
+  // Rewrite absolute URLs
+  html = html.replace(
+    /(href|src|action)="(https?:\/\/[^"]+)"/gi,
+    (match, attr, url) => {
+      const encodedUrl = encodeURIComponent(url);
+      return `${attr}="${proxyPrefix}/${encodedUrl}"`;
+    }
+  );
+
+  // Rewrite protocol-relative URLs
+  html = html.replace(
+    /(href|src|action)="(\/\/[^"]+)"/gi,
+    (match, attr, url) => {
+      const fullUrl = 'https:' + url;
+      const encodedUrl = encodeURIComponent(fullUrl);
+      return `${attr}="${proxyPrefix}/${encodedUrl}"`;
+    }
+  );
+
+  // Rewrite root-relative URLs
+  html = html.replace(
+    /(href|src|action)="(\/[^"]+)"/gi,
+    (match, attr, path) => {
+      const fullUrl = origin + path;
+      const encodedUrl = encodeURIComponent(fullUrl);
+      return `${attr}="${proxyPrefix}/${encodedUrl}"`;
+    }
+  );
+
+  // Rewrite CSS url() references
+  html = html.replace(
+    /url\((["']?)([^)]+)\1\)/gi,
+    (match, quote, url) => {
+      url = url.trim();
+      if (url.startsWith('data:')) return match;
+
+      let fullUrl;
+      if (url.startsWith('http')) {
+        fullUrl = url;
+      } else if (url.startsWith('//')) {
+        fullUrl = 'https:' + url;
+      } else if (url.startsWith('/')) {
+        fullUrl = origin + url;
+      } else {
+        fullUrl = new URL(url, targetUrl).href;
+      }
+
+      const encodedUrl = encodeURIComponent(fullUrl);
+      return `url(${quote}${proxyPrefix}/${encodedUrl}${quote})`;
+    }
+  );
+
+  return html;
+}
+
+// Main proxy endpoint with /service/ prefix
+app.get('/service/:url(*)', async (req, res) => {
+  try {
+    const targetUrl = decodeURIComponent(req.params.url);
+
+    // Validate URL
+    let validUrl;
+    try {
+      validUrl = new URL(targetUrl);
+    } catch (e) {
+      return res.status(400).send('Invalid URL');
+    }
+
+    console.log('Proxying:', targetUrl);
+
+    // Forward request to target
+    const response = await fetch(targetUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+        'Accept': req.headers['accept'] || '*/*',
+        'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+        'Referer': validUrl.origin,
+        'Cookie': req.headers['cookie'] || ''
+      },
+      redirect: 'follow'
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+
+    // Handle HTML - apply URL rewriting
+    if (contentType.includes('text/html')) {
+      let html = await response.text();
+      const proxyPrefix = '/service';
+      html = rewriteUrls(html, targetUrl, proxyPrefix);
+
+      // Inject base tag to help with relative URLs
+      html = html.replace(
+        /<head>/i,
+        `<head><base href="${targetUrl}">`
+      );
+
+      res.setHeader('Content-Type', 'text/html');
+      return res.send(html);
+    }
+
+    // Handle CSS - rewrite URLs in stylesheets
+    if (contentType.includes('text/css')) {
+      let css = await response.text();
+      const proxyPrefix = '/service';
+
+      // Rewrite url() in CSS
+      css = css.replace(
+        /url\((["']?)([^)]+)\1\)/gi,
+        (match, quote, url) => {
+          url = url.trim();
+          if (url.startsWith('data:')) return match;
+
+          let fullUrl;
+          if (url.startsWith('http')) {
+            fullUrl = url;
+          } else if (url.startsWith('//')) {
+            fullUrl = 'https:' + url;
+          } else if (url.startsWith('/')) {
+            fullUrl = new URL(validUrl.origin + url).href;
+          } else {
+            fullUrl = new URL(url, targetUrl).href;
+          }
+
+          const encodedUrl = encodeURIComponent(fullUrl);
+          return `url(${quote}${proxyPrefix}/${encodedUrl}${quote})`;
+        }
+      );
+
+      res.setHeader('Content-Type', 'text/css');
+      return res.send(css);
+    }
+
+    // Handle JavaScript - basic rewriting
+    if (contentType.includes('javascript') || contentType.includes('application/json')) {
+      const body = await response.text();
+      res.setHeader('Content-Type', contentType);
+      return res.send(body);
+    }
+
+    // Handle binary content (images, fonts, etc.)
+    const buffer = await response.buffer();
+    res.setHeader('Content-Type', contentType);
+    return res.send(buffer);
+
+  } catch (error) {
+    console.error('Proxy error:', error);
+    res.status(500).send(`Proxy Error: ${error.message}`);
+  }
+});
+
+// WebSocket upgrade handler for full compatibility
+app.on('upgrade', (req, socket, head) => {
+  console.log('WebSocket upgrade request received');
+
+  // Extract target URL from the path
+  const match = req.url.match(/^\/service\/(.+)/);
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+
+  const targetUrl = decodeURIComponent(match[1]);
+
+  try {
+    const target = new URL(targetUrl);
+    const wsProtocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${target.host}${target.pathname}${target.search}`;
+
+    console.log('Upgrading WebSocket to:', wsUrl);
+
+    // Create WebSocket proxy
+    const proxy = createProxyMiddleware({
+      target: wsUrl,
+      changeOrigin: true,
+      ws: true,
+      pathRewrite: {
+        '^/service/.*': ''
+      }
+    });
+
+    proxy.upgrade(req, socket, head);
+  } catch (error) {
+    console.error('WebSocket upgrade error:', error);
+    socket.destroy();
+  }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', message: 'Proxy server is running' });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Proxy Server</title>
+        <style>
+          body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            line-height: 1.6;
+          }
+          code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+          }
+        </style>
+      </head>
+      <body>
+        <h1>🌐 Proxy Server Running</h1>
+        <p>Server is active and ready to proxy requests.</p>
+        <h2>Usage:</h2>
+        <p>Access websites through the proxy using:</p>
+        <code>http://your-server.com/service/ENCODED_URL</code>
+        <h2>Example:</h2>
+        <code>http://your-server.com/service/${encodeURIComponent('https://example.com')}</code>
+        <h2>Features:</h2>
+        <ul>
+          <li>✅ URL Rewriting for HTML, CSS, and JS</li>
+          <li>✅ WebSocket Support</li>
+          <li>✅ Cookie Handling</li>
+          <li>✅ CORS Enabled</li>
+        </ul>
+      </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Proxy server running on port ${PORT}`);
+  console.log(`📡 Health check: http://localhost:${PORT}/health`);
+  console.log(`🌐 Proxy endpoint: http://localhost:${PORT}/service/[URL]`);
+});
